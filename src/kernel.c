@@ -1,6 +1,6 @@
 /*  OS/2025 – writable 2025FS + CLI + ELF32 loader (fixed 32‑byte dirent)
  *
- *  빌드:
+ *  build:
  *     gcc   -m32 -ffreestanding -nostdlib -c kernel.c
  *     ld    -m elf_i386 -T link.ld -nostdlib -o kernel.elf kernel.o
  *     objcopy -O binary kernel.elf kernel.bin
@@ -218,6 +218,43 @@ static void cmd_rmdir(const char*name){
 static void cmd_devs(void){
     puts("\n  OS/2025 Contributors:\n  ----------------------\n  - kdy010010  (Lead developer)\n  - modemaker\n  - tajo1243\n  - JK\n\n");
 }
+/* --- 경로에서 디렉터리와 파일명 분리 --- */
+static int split_path(const char*path, char*dir, char*name){
+    int len = strlen(path);
+    int slash = -1;
+    for(int i=0;i<len;i++) if(path[i]=='/') slash=i;
+    if(slash==-1){
+        dir[0]='\0'; strncpy(name,path,24);
+    } else {
+        strncpy(dir,path,slash);
+        dir[slash]='\0';
+        strncpy(name,path+slash+1,24);
+    }
+    return slash!=-1;
+}
+
+/* --- 지정된 경로의 디렉터리 LBA 찾기 (상대 또는 절대) --- */
+static uint32_t resolve_dir(const char*path){
+    if(!path[0]) return cur_dir;
+    if(!strcmp(path,"/")) return ROOT_LBA;
+
+    uint32_t dir = (path[0]=='/') ? ROOT_LBA : cur_dir;
+    char token[24]; int i=0,j=0;
+    while(1){
+        if(path[i]=='/' || path[i]=='\0'){
+            if(j>0){
+                token[j]='\0';
+                dirent_t e;
+                if(!fs_find(dir,token,&e) || e.size!=0) return 0; /* not dir */
+                dir = e.lba;
+                j=0;
+            }
+            if(path[i]=='\0') break;
+        } else token[j++]=path[i];
+        i++;
+    }
+    return dir;
+}
 
 /* ---------- CLI loop ---------- */
 static char line[128];
@@ -243,9 +280,9 @@ else if(!strncmp(line,"run ",4)){
     const char *fname = line + 4;
     dirent_t e;
 
-    /* 1. 현재 디렉터리 우선 */
+    /* 1️ 현재 디렉터리 우선 */
     if(!fs_find(cur_dir, fname, &e)){
-        /* 2. 루트(/)의 bin/ 폴더 fallback */
+        /* 2️ 루트(/)의 bin/ 폴더 fallback */
         dirent_t bin;
         if( fs_find(ROOT_LBA, "bin", &bin) && bin.size == 0 ){   /* bin is dir */
             if( fs_find(bin.lba, fname, &e) == 0 ){              /* 여기도 실패 */
@@ -268,28 +305,95 @@ else if(!strncmp(line,"run ",4)){
         else if(!strcmp(line,"pwd")){
             putc('/');for(int i=0;i<path_depth;++i){puts(path_name[i]);putc('/');}putc('\n');
         }
-        else if(!strncmp(line,"mv ",3)){
-            char *args=line+3;char *space=args;while(*space&&*space!=' ')++space; if(!*space){puts("usage: mv <old> <new>\n");continue;}
-            *space='\0';char*old=args;char*new=space+1;dirent_t e;if(!fs_find(cur_dir,old,&e)){puts("no such file\n");continue;}
-            if(strlen(new)>23){puts("new name too long\n");continue;}
-            ata_read28(cur_dir,1,sec);
-            for(int o=0;o<512;o+=sizeof(dirent_t)){
-                dirent_t*de=(dirent_t*)(sec+o);if(!strcmp(de->name,old)){strncpy(de->name,new,24);fs_write_dir(cur_dir);puts("renamed\n");break;}
-            }
+else if(!strncmp(line,"mv ",3)){
+    char *args=line+3;
+    char *space=args;
+    while(*space && *space!=' ') ++space;
+    if(!*space){puts("usage: mv <src> <dst>\n"); continue;}
+    *space='\0';
+    char *src=args, *dst=space+1;
+
+    dirent_t e;
+    if(!fs_find(cur_dir,src,&e)){ puts("no such file\n"); continue; }
+
+    /* 1️ 대상 경로 분리 */
+    char dirpart[64], namepart[24];
+    split_path(dst, dirpart, namepart);
+
+    /* 2️ 대상 디렉터리 찾기 */
+    uint32_t dst_dir = resolve_dir(dirpart);
+    if(!dst_dir){ puts("no such directory\n"); continue; }
+
+    /* 3️ 이름 없으면 기존 이름 유지 */
+    if(namepart[0]=='\0') strncpy(namepart, src, 24);
+
+    /* 4️ 중복 이름 방지 */
+    dirent_t tmp;
+    if(fs_find(dst_dir,namepart,&tmp)){ puts("dest exists\n"); continue; }
+
+    /* 5️ 복사 dirent */
+    if(dst_dir != cur_dir){
+        ata_read28(dst_dir,1,sec);
+        fs_add_entry(dst_dir,namepart,e.lba,e.size);
+        /* 원본 dirent 삭제 */
+        ata_read28(cur_dir,1,sec);
+        for(int o=0;o<512;o+=sizeof(dirent_t)){
+            dirent_t*de=(dirent_t*)(sec+o);
+            if(!strcmp(de->name,src)){ memset(de,0,sizeof(dirent_t)); break; }
         }
-        else if(!strncmp(line,"cp ",3)){
-            char *args=line+3;char *space=args;while(*space&&*space!=' ')++space; if(!*space){puts("usage: cp <src> <dst>\n");continue;}
-            *space='\0';char *src=args;char *dst=space+1;dirent_t e;if(!fs_find(cur_dir,src,&e)){puts("no such file\n");continue;}
-            if(e.size==0){puts("dir copy unsupported\n");continue;}
-            if(strlen(dst)>23||fs_find(cur_dir,dst,&(dirent_t){0})){puts("dest exists or name too long\n");continue;}
-            uint8_t*buf=(void*)0x300000;fs_load_file(&e,buf);uint32_t sc=(e.size+511)/512;uint32_t lba=get_free_lba(sc);
-            ata_write28(lba,sc,buf);fs_add_entry(cur_dir,dst,lba,e.size);puts("copied\n");
+        fs_write_dir(cur_dir);
+        puts("moved\n");
+    } else {
+        /* 같은 디렉터리 이름 변경 */
+        ata_read28(cur_dir,1,sec);
+        for(int o=0;o<512;o+=sizeof(dirent_t)){
+            dirent_t*de=(dirent_t*)(sec+o);
+            if(!strcmp(de->name,src)){ strncpy(de->name,namepart,24); fs_write_dir(cur_dir); puts("renamed\n"); break; }
         }
+    }
+}
+
+else if(!strncmp(line,"cp ",3)){
+    char *args=line+3;
+    char *space=args;
+    while(*space && *space!=' ') ++space;
+    if(!*space){ puts("usage: cp <src> <dst>\n"); continue; }
+    *space='\0';
+    char *src=args, *dst=space+1;
+
+    dirent_t e;
+    if(!fs_find(cur_dir,src,&e)){ puts("no such file\n"); continue; }
+    if(e.size==0){ puts("dir copy unsupported\n"); continue; }
+
+    /* 1️ 경로 분리 */
+    char dirpart[64], namepart[24];
+    split_path(dst, dirpart, namepart);
+
+    /* 2️ 대상 디렉터리 */
+    uint32_t dst_dir = resolve_dir(dirpart);
+    if(!dst_dir){ puts("no such directory\n"); continue; }
+
+    /* 3️ 이름 없으면 원본 이름 */
+    if(namepart[0]=='\0') strncpy(namepart, src, 24);
+
+    if(strlen(namepart)>23){ puts("name too long\n"); continue; }
+    if(fs_find(dst_dir,namepart,&(dirent_t){0})){ puts("dest exists\n"); continue; }
+
+    /* 4️ 파일 복사 */
+    uint8_t*buf=(void*)0x300000;
+    fs_load_file(&e,buf);
+    uint32_t sc=(e.size+511)/512;
+    uint32_t lba=get_free_lba(sc);
+    ata_write28(lba,sc,buf);
+    fs_add_entry(dst_dir,namepart,lba,e.size);
+    puts("copied\n");
+}
+
         else if(!strcmp(line,"devs")) cmd_devs();
 /* ── CLI 끝부분 ────────────────────────────────────────── */
 /* --- 실행 시도: 현재 dir → /bin → .elf 보강 -------------------------- */
 /* ─── 내부 전용 “이름 + .elf” 조합기 ─────────────────── */
-/* ── CLI 끝부분 ────────────────────────────────────────── */
+/* ── CLI 끝부분 (작동을 안하는) */
 else {                                    /* 아무 명령에도 안 맞을 때 */
     const char *fname = line;
     dirent_t e;
@@ -309,7 +413,7 @@ else {                                    /* 아무 명령에도 안 맞을 때 
         }
     }
 
-    if (e.size == 0) {         /* 디렉터리라면 실행 거부 되겠냐고 */
+    if (e.size == 0) {         /* 디렉터리라면 실행 거부 */
         puts("dir\n");
         continue;
     }
@@ -325,7 +429,7 @@ else {                                    /* 아무 명령에도 안 맞을 때 
     }
 }
 
-/* ---------- 엔트리 네이버 아니다 ---------- */
+/* ---------- entry ---------- */
 void kmain(void){
     fs_scan_root();
     puts("boot success\n========================================\n        OS/2025 v1.3 (dirent32)\n        Developed by kdy010010\n        Type 'devs' for contributors\n========================================\n\nType 'help' to see available commands.\n\n");
