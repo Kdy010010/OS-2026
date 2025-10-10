@@ -432,6 +432,6 @@ else {                                    /* 아무 명령에도 안 맞을 때 
 /* ---------- entry ---------- */
 void kmain(void){
     fs_scan_root();
-    puts("boot success\n========================================\n        OS/2025 v1.3 (dirent32)\n        Developed by kdy010010\n        Type 'devs' for contributors\n========================================\n\nType 'help' to see available commands.\n\n");
+    puts("boot success\n========================================\n        OS/2025 v2 (dirent32)\n        Developed by kdy010010\n        Type 'devs' for contributors\n========================================\n\nType 'help' to see available commands.\n\n");
     cli();
 }
